@@ -414,6 +414,7 @@ with tab_users:
                 use_container_width=True,
             )
 
+
         user_task_ids = load_task_ids_for_user(selected_user_ids, start_date, end_date)
         user_tasks = [t for t in load_tasks() if t.get("id") in user_task_ids]
 
