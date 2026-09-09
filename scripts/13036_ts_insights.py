@@ -20,6 +20,7 @@ else:  # Running outside of Peliqan
 
 import streamlit as st
 import plotly.graph_objects as go
+from datetime import date, timedelta
 
 # =====================================================
 # Config
@@ -68,7 +69,7 @@ def load_tasks():
 
 
 @st.cache_data(ttl=300)
-def load_hours_by_user_for_project(project_id):
+def load_hours_by_user_for_project(project_id, start_date, end_date):
     dbconn = pq.dbconnect(DW_NAME)
     sql = f"""
         SELECT
@@ -78,6 +79,7 @@ def load_hours_by_user_for_project(project_id):
         JOIN ts_prod.tasks tk ON tk.id = t.task_id
         JOIN ts_prod.users u ON u.id::text = t.user_id
         WHERE tk.project_id = {int(project_id)}
+          AND t.date::date BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
         GROUP BY u.name
         ORDER BY total_minutes DESC
     """
@@ -94,7 +96,7 @@ def load_users():
 
 
 @st.cache_data(ttl=300)
-def load_hours_by_project_for_user(user_id):
+def load_hours_by_project_for_user(user_id, start_date, end_date):
     dbconn = pq.dbconnect(DW_NAME)
     sql = f"""
         SELECT
@@ -104,6 +106,7 @@ def load_hours_by_project_for_user(user_id):
         JOIN ts_prod.tasks tk ON tk.id = t.task_id
         JOIN ts_prod.projects p ON p.id = tk.project_id
         WHERE t.user_id::text = '{int(user_id)}'
+          AND t.date::date BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
         GROUP BY p.name
         ORDER BY total_minutes DESC
     """
@@ -111,15 +114,36 @@ def load_hours_by_project_for_user(user_id):
 
 
 @st.cache_data(ttl=300)
-def load_task_ids_for_user(user_id):
+def load_task_ids_for_user(user_id, start_date, end_date):
     dbconn = pq.dbconnect(DW_NAME)
     sql = f"""
         SELECT DISTINCT task_id
         FROM ts_prod.timetable
         WHERE user_id::text = '{int(user_id)}'
+          AND date::date BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
     """
     df = dbconn.fetch(DW_NAME, query=sql, df=True)
     return set(df["task_id"].tolist()) if not df.empty else set()
+
+
+def hours_granularity(start_date, end_date):
+    return "week" if (end_date - start_date).days > 60 else "day"
+
+
+@st.cache_data(ttl=300)
+def load_hours_over_time_for_user(user_id, start_date, end_date, granularity):
+    dbconn = pq.dbconnect(DW_NAME)
+    sql = f"""
+        SELECT
+            date_trunc('{granularity}', date::date) AS period,
+            SUM(duration) AS total_minutes
+        FROM ts_prod.timetable
+        WHERE user_id::text = '{int(user_id)}'
+          AND date::date BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
+        GROUP BY period
+        ORDER BY period
+    """
+    return dbconn.fetch(DW_NAME, query=sql, df=True)
 
 
 def is_truthy(value):
@@ -138,7 +162,34 @@ def pie_chart(labels, values, title):
     return fig
 
 
+def hours_line_chart(x, y, x_title, y_title):
+    fig = go.Figure(go.Scatter(x=x, y=y, mode="lines+markers"))
+    fig.update_layout(
+        xaxis_title=x_title,
+        yaxis_title=y_title,
+        xaxis=dict(tickformat="%d-%m-%Y", tickfont=dict(size=16)),
+        yaxis=dict(tickfont=dict(size=16)),
+        font=dict(size=16),
+        margin=dict(t=20, b=0, l=0, r=0),
+        height=350,
+    )
+    return fig
+
+
 st.title("Insights")
+
+period_col, _ = st.columns([1, 3])
+with period_col:
+    date_range = st.date_input(
+        "Period",
+        value=(date.today() - timedelta(days=90), date.today()),
+        key="global_date_range",
+    )
+
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    start_date, end_date = date_range
+else:
+    start_date, end_date = date.today() - timedelta(days=90), date.today()
 
 tab_clients, tab_users = st.tabs(["Clients", "Users"])
 
@@ -196,7 +247,7 @@ with tab_clients:
                 )
 
             st.subheader("Most hours logged")
-            hours_by_user = load_hours_by_user_for_project(selected_project_id)
+            hours_by_user = load_hours_by_user_for_project(selected_project_id, start_date, end_date)
 
             if hours_by_user.empty:
                 st.info("No hours logged for this project yet.")
@@ -272,7 +323,7 @@ with tab_users:
                 st.caption(selected_user["email"])
 
         st.subheader("Most hours logged")
-        hours_by_project = load_hours_by_project_for_user(selected_user_id)
+        hours_by_project = load_hours_by_project_for_user(selected_user_id, start_date, end_date)
 
         if hours_by_project.empty:
             st.info("No hours logged by this user yet.")
@@ -288,7 +339,25 @@ with tab_users:
                 },
             )
 
-        user_task_ids = load_task_ids_for_user(selected_user_id)
+        st.subheader("Hours over time")
+        granularity = hours_granularity(start_date, end_date)
+        hours_over_time = load_hours_over_time_for_user(selected_user_id, start_date, end_date, granularity)
+
+        if hours_over_time.empty:
+            st.info("No hours logged by this user in the selected period.")
+        else:
+            hours_over_time["hours"] = hours_over_time["total_minutes"] / 60.0
+            st.plotly_chart(
+                hours_line_chart(
+                    hours_over_time["period"],
+                    hours_over_time["hours"],
+                    granularity.capitalize(),
+                    "Hours",
+                ),
+                use_container_width=True,
+            )
+
+        user_task_ids = load_task_ids_for_user(selected_user_id, start_date, end_date)
         user_tasks = [t for t in load_tasks() if t.get("id") in user_task_ids]
 
         if not user_tasks:
