@@ -18,399 +18,292 @@ else:  # Running outside of Peliqan
     except Exception:
         RUN_CONTEXT = "background"
 
-"""
-project_bi_dashboard (v1.1)
-
-BI dashboard for project analytics, built on top of timesheet data.
-
-Data sources:
-  - ts_reporting.fact_timetable      : read-only, already joins timetable
-                                        entries with tasks, projects, clients
-                                        and users.
-  - ts_prod.timetable_submissions    : weekly submit -> approve workflow per
-                                        user. Joined here on user_id + the
-                                        Monday of the entry's week, so every
-                                        logged hour can be classified as
-                                        Draft / Submitted / Approved.
-
-This app is read-only - it never writes to ts_prod.timetable or
-ts_prod.timetable_submissions, it only reports on them.
-"""
-
 import streamlit as st
-import pandas as pd
-from datetime import date, timedelta
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="Project BI Dashboard", layout="wide")
+# =====================================================
+# Config
+# =====================================================
 
-st.markdown(
-    """
-    <style>
-        .block-container { padding-top: 1.5rem !important; max-width: 100% !important; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+DW_NAME = "dw_3202"
+SCHEMA = "ts_prod"
 
-STATUS_LABELS = {
-    None: "Draft",
-    "submitted": "Submitted",
-    "confirmed": "Approved",
-}
+CLIENTS_TABLE = "clients"
+USERS_TABLE = "users"
+PROJECTS_TABLE = "projects"
+TASKS_TABLE = "tasks"
+
+TASK_STATUSES = ["done", "todo", "in_progress"]
+
+# Client 43 ("Internal Support") is not a real client - it's a bucket. Projects
+# under it are named after the real client they were support work for, so
+# those hours belong to that client too (matched by project name == client name).
+INTERNAL_SUPPORT_CLIENT_ID = 43
+
+st.set_page_config(page_title="Insights", layout="wide")
 
 # =====================================================
 # Data loading
 # =====================================================
 
 @st.cache_data(ttl=300)
-def load_entries():
-    dbconn = pq.dbconnect(pq.DW_NAME)
-    sql = """
-        WITH entries AS (
-            SELECT
-                e.entry_id,
-                e.entry_date,
-                CAST(date_trunc('week', e.entry_date) AS date) AS week_start,
-                e.duration,
-                e.billable,
-                e.approved,
-                e.task_name,
-                e.task_status,
-                e.project_name,
-                e.project_status,
-                e.project_end_date,
-                e.client_name,
-                e.user_id,
-                e.user_name
-            FROM ts_reporting.fact_timetable e
-        ),
-        subs AS (
-            SELECT
-                user_id,
-                CAST(week_start_date AS date) AS week_start,
-                status
-            FROM ts_prod.timetable_submissions
-        )
+def load_clients():
+    dbconn = pq.dbconnect(DW_NAME)
+    return sorted(
+        dbconn.fetch(DW_NAME, SCHEMA, CLIENTS_TABLE) or [],
+        key=lambda c: (c.get("name") or "").lower()
+    )
+
+
+@st.cache_data(ttl=300)
+def load_projects():
+    dbconn = pq.dbconnect(DW_NAME)
+    return dbconn.fetch(DW_NAME, SCHEMA, PROJECTS_TABLE) or []
+
+
+@st.cache_data(ttl=300)
+def load_tasks():
+    dbconn = pq.dbconnect(DW_NAME)
+    return dbconn.fetch(DW_NAME, SCHEMA, TASKS_TABLE) or []
+
+
+@st.cache_data(ttl=300)
+def load_hours_by_user_for_project(project_id):
+    dbconn = pq.dbconnect(DW_NAME)
+    sql = f"""
         SELECT
-            entries.*,
-            subs.status AS submission_status
-        FROM entries
-        LEFT JOIN subs
-            ON subs.user_id = entries.user_id
-           AND subs.week_start = entries.week_start
+            u.name AS user_name,
+            SUM(t.duration) AS total_minutes
+        FROM ts_prod.timetable t
+        JOIN ts_prod.tasks tk ON tk.id = t.task_id
+        JOIN ts_prod.users u ON u.id::text = t.user_id
+        WHERE tk.project_id = {int(project_id)}
+        GROUP BY u.name
+        ORDER BY total_minutes DESC
     """
-    df = dbconn.fetch(pq.DW_NAME, query=sql, df=True)
-    return df
+    return dbconn.fetch(DW_NAME, query=sql, df=True)
 
 
-df = load_entries()
-
-if df.empty:
-    st.warning("No timesheet data found.")
-    st.stop()
-
-df["entry_date"] = pd.to_datetime(df["entry_date"])
-df["hours"] = df["duration"].astype(float) / 60.0
-df["status_label"] = df["submission_status"].map(STATUS_LABELS).fillna("Draft")
-df["month"] = df["entry_date"].dt.to_period("M").dt.to_timestamp()
-df["project_name"] = df["project_name"].fillna("(no project)")
-df["client_name"] = df["client_name"].fillna("(no client)")
-df["task_name"] = df["task_name"].fillna("(no task)")
-df["user_name"] = df["user_name"].fillna("(unknown employee)")
-
-# =====================================================
-# Filters
-# =====================================================
-
-st.title("Project BI Dashboard")
-st.caption("Hours, billability and approval status across all projects, based on logged timesheet entries.")
-
-with st.sidebar:
-    st.header("Filters")
-
-    min_date = df["entry_date"].min().date()
-    max_date = df["entry_date"].max().date()
-    date_range = st.date_input(
-        "Entry date range",
-        value=(max(min_date, max_date - timedelta(days=365)), max_date),
-        min_value=min_date,
-        max_value=max_date,
+@st.cache_data(ttl=300)
+def load_users():
+    dbconn = pq.dbconnect(DW_NAME)
+    return sorted(
+        dbconn.fetch(DW_NAME, SCHEMA, USERS_TABLE) or [],
+        key=lambda u: (u.get("name") or "").lower()
     )
 
-    clients = sorted(df["client_name"].unique().tolist())
 
-    def select_all_clients():
-        st.session_state["selected_clients"] = clients
+@st.cache_data(ttl=300)
+def load_hours_by_project_for_user(user_id):
+    dbconn = pq.dbconnect(DW_NAME)
+    sql = f"""
+        SELECT
+            p.name AS project_name,
+            SUM(t.duration) AS total_minutes
+        FROM ts_prod.timetable t
+        JOIN ts_prod.tasks tk ON tk.id = t.task_id
+        JOIN ts_prod.projects p ON p.id = tk.project_id
+        WHERE t.user_id::text = '{int(user_id)}'
+        GROUP BY p.name
+        ORDER BY total_minutes DESC
+    """
+    return dbconn.fetch(DW_NAME, query=sql, df=True)
 
-    selected_clients = st.multiselect(
-        "Client", clients, default=clients, key="selected_clients"
-    )
-    st.button("Alles selecteren", key="select_all_clients_btn", on_click=select_all_clients)
 
-    statuses = sorted(df["project_status"].dropna().unique().tolist())
-    selected_statuses = st.multiselect("Project status", statuses, default=statuses)
+@st.cache_data(ttl=300)
+def load_task_ids_for_user(user_id):
+    dbconn = pq.dbconnect(DW_NAME)
+    sql = f"""
+        SELECT DISTINCT task_id
+        FROM ts_prod.timetable
+        WHERE user_id::text = '{int(user_id)}'
+    """
+    df = dbconn.fetch(DW_NAME, query=sql, df=True)
+    return set(df["task_id"].tolist()) if not df.empty else set()
 
-    approval_options = ["Draft", "Submitted", "Approved"]
-    selected_approval = st.multiselect("Approval status", approval_options, default=approval_options)
 
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    start_date, end_date = date_range
-else:
-    start_date, end_date = min_date, max_date
+def is_truthy(value):
+    """dbconn.fetch(schema, table) returns booleans as the strings "true"/"false",
+    not Python bools, so a plain truthiness check on the raw value is always True."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
 
-mask = (
-    (df["entry_date"].dt.date >= start_date)
-    & (df["entry_date"].dt.date <= end_date)
-    & (df["client_name"].isin(selected_clients))
-    & (df["status_label"].isin(selected_approval))
-)
-if selected_statuses:
-    mask &= df["project_status"].isin(selected_statuses)
 
-fdf = df[mask].copy()
+def pie_chart(labels, values, title):
+    fig = go.Figure(go.Pie(labels=labels, values=values, hole=0.4))
+    fig.update_layout(title=title, margin=dict(t=40, b=0, l=0, r=0), height=320)
+    return fig
 
-if fdf.empty:
-    st.warning("No entries match the selected filters.")
-    st.stop()
 
-# =====================================================
-# KPI row
-# =====================================================
+st.title("Insights")
 
-total_hours = fdf["hours"].sum()
-billable_hours = fdf.loc[fdf["billable"] == True, "hours"].sum()
-approved_hours = fdf.loc[fdf["status_label"] == "Approved", "hours"].sum()
-active_projects = fdf["project_name"].nunique()
-active_clients = fdf["client_name"].nunique()
+tab_clients, tab_users = st.tabs(["Clients", "Users"])
 
-# Project met de meeste total hours
-hours_by_project = fdf.groupby("project_name")["hours"].sum()
-top_total_project = hours_by_project.idxmax() if not hours_by_project.empty else None
+with tab_clients:
+    clients = load_clients()
 
-# Project met de meeste billable hours
-billable_by_project_kpi = fdf.loc[fdf["billable"] == True].groupby("project_name")["hours"].sum()
-top_billable_project = billable_by_project_kpi.idxmax() if not billable_by_project_kpi.empty else None
+    if not clients:
+        st.info("No clients found.")
+    else:
+        client_options = {c["id"]: c["name"] for c in clients}
 
-# Project met de meeste approved hours
-approved_by_project_kpi = fdf.loc[fdf["status_label"] == "Approved"].groupby("project_name")["hours"].sum()
-top_approved_project = approved_by_project_kpi.idxmax() if not approved_by_project_kpi.empty else None
+        header_col, select_col = st.columns([4, 1])
 
-# Project met de dichtstbijzijnde end date (t.o.v. vandaag, ongeacht verleden/toekomst)
-today_ts = pd.Timestamp(date.today())
-project_end_dates = (
-    fdf.drop_duplicates("project_name")
-    .set_index("project_name")["project_end_date"]
-    .pipe(pd.to_datetime, errors="coerce")
-    .dropna()
-)
-closest_end_project = (project_end_dates - today_ts).abs().idxmin() if not project_end_dates.empty else None
+        with select_col:
+            selected_client_id = st.selectbox(
+                "Client",
+                options=list(client_options.keys()),
+                format_func=lambda cid: client_options[cid],
+                key="clients_tab_selected_client_id",
+                label_visibility="collapsed",
+            )
 
-# Client met de meeste projecten
-projects_by_client = fdf.groupby("client_name")["project_name"].nunique()
-top_client = projects_by_client.idxmax() if not projects_by_client.empty else None
-top_client_count = int(projects_by_client.max()) if not projects_by_client.empty else None
+        selected_client = next(c for c in clients if c["id"] == selected_client_id)
 
-k1, k2, k3, k4, k5 = st.columns(5)
+        with header_col:
+            st.header(selected_client["name"])
+            meta = " · ".join(
+                str(v) for v in (selected_client.get("status"), selected_client.get("category"))
+                if v
+            )
+            if meta:
+                st.caption(meta)
 
-k1.metric("Total hours", f"{total_hours:,.1f}")
-k1.caption(f"Top project: **{top_total_project}**" if top_total_project else "Top project: —")
+        client_projects = sorted(
+            (
+                p for p in load_projects()
+                if p.get("client_id") == selected_client_id
+                or (p.get("client_id") == INTERNAL_SUPPORT_CLIENT_ID and p.get("name") == selected_client["name"])
+            ),
+            key=lambda p: (p.get("name") or "").lower()
+        )
 
-k2.metric("Billable hours", f"{billable_hours:,.1f}", f"{(billable_hours / total_hours * 100):.0f}% of total" if total_hours else None)
-k2.caption(f"Top project: **{top_billable_project}**" if top_billable_project else "Top project: —")
+        if not client_projects:
+            st.info("No projects found for this client.")
+        else:
+            project_options = {p["id"]: p["name"] for p in client_projects}
 
-k3.metric("Approved hours", f"{approved_hours:,.1f}", f"{(approved_hours / total_hours * 100):.0f}% of total" if total_hours else None)
-k3.caption(f"Top project: **{top_approved_project}**" if top_approved_project else "Top project: —")
+            proj_select_col, _ = st.columns([1, 3])
+            with proj_select_col:
+                selected_project_id = st.selectbox(
+                    "Project",
+                    options=list(project_options.keys()),
+                    format_func=lambda pid: project_options[pid],
+                    key="clients_tab_selected_project_id",
+                )
 
-k4.metric("Active projects", active_projects)
-k4.caption(f"Closest end date: **{closest_end_project}**" if closest_end_project else "Closest end date: —")
+            st.subheader("Most hours logged")
+            hours_by_user = load_hours_by_user_for_project(selected_project_id)
 
-k5.metric("Active clients", active_clients)
-k5.caption(f"Most projects: **{top_client}** ({top_client_count})" if top_client else "Most projects: —")
+            if hours_by_user.empty:
+                st.info("No hours logged for this project yet.")
+            else:
+                hours_by_user["hours"] = (hours_by_user["total_minutes"] / 60.0).round(1)
+                st.dataframe(
+                    hours_by_user[["user_name", "hours"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "user_name": "User",
+                        "hours": "Hours",
+                    },
+                )
 
-st.divider()
+            project_tasks = [t for t in load_tasks() if t.get("project_id") == selected_project_id]
 
-# =====================================================
-# Project summary table
-# =====================================================
+            if not project_tasks:
+                st.info("No tasks found for this project.")
+            else:
+                pie_col1, pie_col2 = st.columns(2)
 
-st.subheader("Hours by project")
+                with pie_col1:
+                    billable_count = sum(1 for t in project_tasks if is_truthy(t.get("billable")))
+                    non_billable_count = len(project_tasks) - billable_count
+                    st.plotly_chart(
+                        pie_chart(
+                            ["Billable", "Non-billable"],
+                            [billable_count, non_billable_count],
+                            "Tasks by billable",
+                        ),
+                        use_container_width=True,
+                    )
 
-project_summary = (
-    fdf.pivot_table(
-        index=["project_name", "client_name", "project_status", "project_end_date"],
-        columns="status_label",
-        values="hours",
-        aggfunc="sum",
-        fill_value=0,
-    )
-    .reset_index()
-)
-for col in approval_options:
-    if col not in project_summary.columns:
-        project_summary[col] = 0.0
+                with pie_col2:
+                    status_counts = {
+                        status: sum(1 for t in project_tasks if t.get("status") == status)
+                        for status in TASK_STATUSES
+                    }
+                    st.plotly_chart(
+                        pie_chart(
+                            list(status_counts.keys()),
+                            list(status_counts.values()),
+                            "Tasks by status",
+                        ),
+                        use_container_width=True,
+                    )
 
-billable_by_project = fdf.groupby("project_name")["hours"].apply(lambda s: s[fdf.loc[s.index, "billable"] == True].sum())
-users_by_project = fdf.groupby("project_name")["user_name"].nunique()
+with tab_users:
+    users = load_users()
 
-project_summary["Total hours"] = project_summary[approval_options].sum(axis=1)
-project_summary["Billable hours"] = project_summary["project_name"].map(billable_by_project).fillna(0)
-project_summary["Distinct users"] = project_summary["project_name"].map(users_by_project).fillna(0).astype(int)
-project_summary = project_summary.sort_values("Total hours", ascending=False)
+    if not users:
+        st.info("No users found.")
+    else:
+        user_options = {u["id"]: u["name"] for u in users}
 
-display_cols = ["project_name", "client_name", "project_status", "project_end_date",
-                 "Total hours", "Billable hours", "Draft", "Submitted", "Approved", "Distinct users"]
-st.dataframe(
-    project_summary[display_cols].round(1),
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "project_name": "Project",
-        "client_name": "Client",
-        "project_status": "Status",
-        "project_end_date": "End date",
-    },
-)
+        header_col, select_col = st.columns([4, 1])
 
-st.divider()
+        with select_col:
+            selected_user_id = st.selectbox(
+                "User",
+                options=list(user_options.keys()),
+                format_func=lambda uid: user_options[uid],
+                key="users_tab_selected_user_id",
+                label_visibility="collapsed",
+            )
 
-# =====================================================
-# Projects nearing / past their end date with unapproved hours
-# =====================================================
+        selected_user = next(u for u in users if u["id"] == selected_user_id)
 
-st.subheader("Attention needed: projects past end date with unapproved hours")
-today = pd.Timestamp(date.today())
-project_summary["project_end_date"] = pd.to_datetime(project_summary["project_end_date"], errors="coerce")
-flagged = project_summary[
-    (project_summary["project_end_date"].notna())
-    & (project_summary["project_end_date"] < today)
-    & ((project_summary["Draft"] + project_summary["Submitted"]) > 0)
-]
-if flagged.empty:
-    st.success("No overdue projects with unapproved hours.")
-else:
-    st.dataframe(
-        flagged[["project_name", "client_name", "project_end_date", "Draft", "Submitted", "Approved"]].round(1),
-        use_container_width=True,
-        hide_index=True,
-    )
+        with header_col:
+            st.header(selected_user["name"])
+            if selected_user.get("email"):
+                st.caption(selected_user["email"])
 
-st.divider()
+        st.subheader("Most hours logged")
+        hours_by_project = load_hours_by_project_for_user(selected_user_id)
 
-# =====================================================
-# Employee time breakdown: client -> project -> employee -> task
-# =====================================================
+        if hours_by_project.empty:
+            st.info("No hours logged by this user yet.")
+        else:
+            hours_by_project["hours"] = (hours_by_project["total_minutes"] / 60.0).round(1)
+            st.dataframe(
+                hours_by_project[["project_name", "hours"]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "project_name": "Project",
+                    "hours": "Hours",
+                },
+            )
 
-st.header("Employee time breakdown")
-st.caption("Who worked how long on which project for which client, and on what tasks.")
+        user_task_ids = load_task_ids_for_user(selected_user_id)
+        user_tasks = [t for t in load_tasks() if t.get("id") in user_task_ids]
 
-drill_col1, drill_col2, drill_col3 = st.columns(3)
+        if not user_tasks:
+            st.info("No tasks found for this user.")
+        else:
+            pie_col, _ = st.columns(2)
 
-with drill_col1:
-    drill_clients = sorted(fdf["client_name"].unique().tolist())
-    drill_client = st.selectbox("1. Select client", ["(all)"] + drill_clients, key="drill_client")
-
-client_scoped = fdf if drill_client == "(all)" else fdf[fdf["client_name"] == drill_client]
-
-with drill_col2:
-    drill_projects = sorted(client_scoped["project_name"].unique().tolist())
-    drill_project = st.selectbox("2. Select project", ["(all)"] + drill_projects, key="drill_project")
-
-project_scoped = client_scoped if drill_project == "(all)" else client_scoped[client_scoped["project_name"] == drill_project]
-
-with drill_col3:
-    drill_employees = sorted(project_scoped["user_name"].unique().tolist())
-    drill_employee = st.selectbox("3. Select employee", ["(all)"] + drill_employees, key="drill_employee")
-
-employee_scoped = project_scoped if drill_employee == "(all)" else project_scoped[project_scoped["user_name"] == drill_employee]
-
-if employee_scoped.empty:
-    st.info("No hours logged for this combination.")
-else:
-    drill_total = employee_scoped["hours"].sum()
-    st.metric("Hours for current selection", f"{drill_total:,.1f}")
-
-    task_breakdown = (
-        employee_scoped.groupby(["client_name", "project_name", "user_name", "task_name"])["hours"]
-        .sum()
-        .reset_index()
-        .sort_values("hours", ascending=False)
-    )
-    task_breakdown["hours"] = task_breakdown["hours"].round(1)
-    st.dataframe(
-        task_breakdown,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "client_name": "Client",
-            "project_name": "Project",
-            "user_name": "Employee",
-            "task_name": "Task",
-            "hours": "Hours",
-        },
-    )
-
-    if drill_employee == "(all)" and employee_scoped["user_name"].nunique() > 1:
-        st.subheader("Hours by employee (current selection)")
-        emp_hours = employee_scoped.groupby("user_name")["hours"].sum().sort_values(ascending=False)
-        st.bar_chart(emp_hours)
-
-st.divider()
-
-# =====================================================
-# Full summary: employee x project x task, filterable/sortable
-# =====================================================
-
-st.subheader("Employee x Project x Task summary (all filtered data)")
-
-summary_col1, summary_col2, summary_col3 = st.columns(3)
-with summary_col1:
-    f_clients = st.multiselect("Filter client(s)", sorted(fdf["client_name"].unique().tolist()), key="summary_clients")
-with summary_col2:
-    f_projects = st.multiselect("Filter project(s)", sorted(fdf["project_name"].unique().tolist()), key="summary_projects")
-with summary_col3:
-    f_employees = st.multiselect("Filter employee(s)", sorted(fdf["user_name"].unique().tolist()), key="summary_employees")
-
-summary_df = fdf.copy()
-if f_clients:
-    summary_df = summary_df[summary_df["client_name"].isin(f_clients)]
-if f_projects:
-    summary_df = summary_df[summary_df["project_name"].isin(f_projects)]
-if f_employees:
-    summary_df = summary_df[summary_df["user_name"].isin(f_employees)]
-
-full_summary = (
-    summary_df.groupby(["client_name", "project_name", "user_name", "task_name"])
-    .agg(
-        hours=("hours", "sum"),
-        billable_hours=("hours", lambda s: s[summary_df.loc[s.index, "billable"] == True].sum()),
-        entries=("entry_id", "count"),
-    )
-    .reset_index()
-    .sort_values("hours", ascending=False)
-)
-full_summary["hours"] = full_summary["hours"].round(1)
-full_summary["billable_hours"] = full_summary["billable_hours"].round(1)
-
-st.dataframe(
-    full_summary,
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "client_name": "Client",
-        "project_name": "Project",
-        "user_name": "Employee",
-        "task_name": "Task",
-        "hours": "Total hours",
-        "billable_hours": "Billable hours",
-        "entries": "# entries",
-    },
-)
-st.caption(f"{len(full_summary)} rows. Use the column headers in the table to sort; use the filters above to narrow down.")
-
-with st.expander("Show raw filtered entries"):
-    st.dataframe(
-        fdf[["entry_date", "project_name", "client_name", "task_name", "user_name",
-             "hours", "billable", "status_label"]].sort_values("entry_date", ascending=False),
-        use_container_width=True,
-        hide_index=True,
-    )
+            with pie_col:
+                billable_count = sum(1 for t in user_tasks if is_truthy(t.get("billable")))
+                non_billable_count = len(user_tasks) - billable_count
+                st.plotly_chart(
+                    pie_chart(
+                        ["Billable", "Non-billable"],
+                        [billable_count, non_billable_count],
+                        "Tasks by billable",
+                    ),
+                    use_container_width=True,
+                )
