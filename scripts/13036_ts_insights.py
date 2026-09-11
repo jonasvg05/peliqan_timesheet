@@ -177,6 +177,74 @@ def load_support_hours_over_time(start_date, end_date, granularity):
     return dbconn.fetch(DW_NAME, query=sql, df=True)
 
 
+@st.cache_data(ttl=300)
+def load_overview_totals(start_date, end_date):
+    dbconn = pq.dbconnect(DW_NAME)
+    sql = f"""
+        SELECT
+            SUM(t.duration) AS total_minutes,
+            COUNT(DISTINCT t.user_id) AS user_count,
+            COUNT(DISTINCT p.id) AS project_count,
+            COUNT(DISTINCT p.client_id) AS client_count
+        FROM ts_prod.timetable t
+        JOIN ts_prod.tasks tk ON tk.id = t.task_id
+        JOIN ts_prod.projects p ON p.id = tk.project_id
+        WHERE t.date::date BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
+    """
+    return dbconn.fetch(DW_NAME, query=sql, df=True)
+
+
+@st.cache_data(ttl=300)
+def load_overview_hours_over_time(start_date, end_date, granularity):
+    dbconn = pq.dbconnect(DW_NAME)
+    sql = f"""
+        SELECT
+            date_trunc('{granularity}', date::date) AS period,
+            SUM(duration) AS total_minutes
+        FROM ts_prod.timetable
+        WHERE date::date BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
+        GROUP BY period
+        ORDER BY period
+    """
+    return dbconn.fetch(DW_NAME, query=sql, df=True)
+
+
+@st.cache_data(ttl=300)
+def load_top_clients_by_hours(start_date, end_date, limit=5):
+    dbconn = pq.dbconnect(DW_NAME)
+    sql = f"""
+        SELECT
+            c.name AS client_name,
+            SUM(t.duration) AS total_minutes
+        FROM ts_prod.timetable t
+        JOIN ts_prod.tasks tk ON tk.id = t.task_id
+        JOIN ts_prod.projects p ON p.id = tk.project_id
+        LEFT JOIN ts_prod.clients c ON c.id = p.client_id
+        WHERE t.date::date BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
+        GROUP BY c.name
+        ORDER BY total_minutes DESC
+        LIMIT {int(limit)}
+    """
+    return dbconn.fetch(DW_NAME, query=sql, df=True)
+
+
+@st.cache_data(ttl=300)
+def load_top_users_by_hours(start_date, end_date, limit=5):
+    dbconn = pq.dbconnect(DW_NAME)
+    sql = f"""
+        SELECT
+            u.name AS user_name,
+            SUM(t.duration) AS total_minutes
+        FROM ts_prod.timetable t
+        JOIN ts_prod.users u ON u.id::text = t.user_id
+        WHERE t.date::date BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
+        GROUP BY u.name
+        ORDER BY total_minutes DESC
+        LIMIT {int(limit)}
+    """
+    return dbconn.fetch(DW_NAME, query=sql, df=True)
+
+
 def hours_granularity(start_date, end_date):
     return "week" if (end_date - start_date).days > 60 else "day"
 
@@ -199,40 +267,106 @@ def load_hours_over_time_for_user(user_ids, start_date, end_date, granularity):
     return dbconn.fetch(DW_NAME, query=sql, df=True)
 
 
-def multiselect_with_controls(label, key, all_ids, id_to_label):
-    """Multiselect with "Select all" / "Clear filters" buttons. An empty
-    selection is treated by callers as "no filter" (i.e. everything), so
-    "Clear filters" empties the box but still shows unfiltered data."""
+@st.cache_data(ttl=300)
+def load_raw_entries(project_ids, user_ids, start_date, end_date):
+    if not project_ids or not user_ids:
+        return pd.DataFrame(columns=[
+            "id", "date", "duration", "internal_description", "external_description",
+            "approved", "user_name", "task_name", "project_name", "client_name",
+        ])
+    dbconn = pq.dbconnect(DW_NAME)
+    sql = f"""
+        SELECT
+            t.id,
+            t.date,
+            t.duration,
+            t.internal_description,
+            t.external_description,
+            t.approved,
+            u.name AS user_name,
+            tk.name AS task_name,
+            p.name AS project_name,
+            c.name AS client_name
+        FROM ts_prod.timetable t
+        JOIN ts_prod.tasks tk ON tk.id = t.task_id
+        JOIN ts_prod.projects p ON p.id = tk.project_id
+        LEFT JOIN ts_prod.clients c ON c.id = p.client_id
+        JOIN ts_prod.users u ON u.id::text = t.user_id
+        WHERE tk.project_id IN ({sql_int_list(project_ids)})
+          AND t.user_id::text IN ({sql_text_list(user_ids)})
+          AND t.date::date BETWEEN '{start_date.isoformat()}' AND '{end_date.isoformat()}'
+        ORDER BY t.date DESC
+    """
+    return dbconn.fetch(DW_NAME, query=sql, df=True)
+
+
+def multiselect_with_controls(label, key, all_ids, id_to_label, searchable=False, on_commit=None):
+    """A closed dropdown (popover) with a checkbox per option to click on to
+    select/deselect it, plus Select all / Clear filters buttons. Checkbox
+    state is the source of truth (each checkbox keeps its own session_state
+    entry, defaulting to checked), so stale options after an upstream filter
+    change are simply ignored instead of crashing. An empty selection is
+    treated as "no filter" (i.e. show everything). If searchable, a live
+    search box narrows which checkboxes are shown, without touching their
+    checked state. If given, on_commit(new_effective_ids, old_effective_ids)
+    fires whenever the effective (empty-means-all) selection actually
+    changes, so a caller can cascade the change into a dependent dropdown."""
     all_ids = list(all_ids)
 
-    existing = st.session_state.get(key)
-    if existing is not None:
-        sanitized = [i for i in existing if i in all_ids]
-        if sanitized != existing:
-            st.session_state[key] = sanitized
+    def checkbox_key(i):
+        return f"{key}_chk_{i}"
 
     def select_all():
-        st.session_state[key] = list(all_ids)
+        for i in all_ids:
+            st.session_state[checkbox_key(i)] = True
 
     def clear_filters():
-        st.session_state[key] = []
+        for i in all_ids:
+            st.session_state[checkbox_key(i)] = False
 
-    ms_col, all_col, clear_col = st.columns([6, 1, 1])
-    with ms_col:
-        selected = st.multiselect(
-            label,
-            options=all_ids,
-            default=all_ids,
-            format_func=lambda i: id_to_label[i],
-            key=key,
-            label_visibility="collapsed",
+    before = {i for i in all_ids if st.session_state.get(checkbox_key(i), True)}
+
+    if not before:
+        summary = f"{label}: All (cleared)"
+    elif len(before) == len(all_ids):
+        summary = f"{label}: All"
+    else:
+        summary = f"{label}: {len(before)}/{len(all_ids)}"
+
+    with st.popover(summary, use_container_width=True):
+        visible_ids = all_ids
+        if searchable:
+            query = st.text_input(
+                "Search", key=f"{key}_search", placeholder="Search...", label_visibility="collapsed"
+            )
+            if query.strip():
+                q = query.strip().lower()
+                visible_ids = [i for i in all_ids if q in id_to_label[i].lower()]
+                if not visible_ids:
+                    st.caption("No matches.")
+
+        b1, b2 = st.columns(2)
+        b1.button(
+            "Select all", key=f"{key}_select_all_btn", on_click=select_all, use_container_width=True
         )
-    with all_col:
-        st.button("Select all", key=f"{key}_select_all_btn", on_click=select_all, use_container_width=True)
-    with clear_col:
-        st.button("Clear filters", key=f"{key}_clear_btn", on_click=clear_filters, use_container_width=True)
+        b2.button(
+            "Clear filters", key=f"{key}_clear_btn", on_click=clear_filters, use_container_width=True
+        )
+        st.divider()
 
-    return selected if selected else list(all_ids)
+        checkbox_cols = st.columns(2)
+        for idx, i in enumerate(visible_ids):
+            with checkbox_cols[idx % 2]:
+                st.checkbox(id_to_label[i], value=True, key=checkbox_key(i))
+
+    after = {i for i in all_ids if st.session_state.get(checkbox_key(i), True)}
+
+    if on_commit and after != before:
+        effective_before = before if before else set(all_ids)
+        effective_after = after if after else set(all_ids)
+        on_commit(effective_after, effective_before)
+
+    return list(after) if after else list(all_ids)
 
 
 def is_truthy(value):
@@ -280,7 +414,72 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
 else:
     start_date, end_date = date.today() - timedelta(days=90), date.today()
 
-tab_clients, tab_users, tab_support = st.tabs(["Clients", "Users", "Support"])
+tab_clients, tab_users, tab_raw = st.tabs(["Clients", "Users", "Raw data"])
+# tab_support disabled - see commented-out "with tab_support:" block below.
+# tab_overview disabled - see commented-out "with tab_overview:" block below.
+
+# with tab_overview:
+#     st.header("Overview")
+#
+#     totals = load_overview_totals(start_date, end_date)
+#     total_minutes = totals["total_minutes"].iloc[0] if not totals.empty else None
+#
+#     if not total_minutes:
+#         st.info("No hours logged in the selected period.")
+#     else:
+#         row = totals.iloc[0]
+#         k1, k2, k3, k4 = st.columns(4)
+#         k1.metric("Total hours", f"{total_minutes / 60.0:,.1f}")
+#         k2.metric("Active clients", int(row["client_count"] or 0))
+#         k3.metric("Active users", int(row["user_count"] or 0))
+#         k4.metric("Active projects", int(row["project_count"] or 0))
+#
+#         st.subheader("Hours over time")
+#         granularity = hours_granularity(start_date, end_date)
+#         overview_trend = load_overview_hours_over_time(start_date, end_date, granularity)
+#
+#         if not overview_trend.empty:
+#             overview_trend["hours"] = overview_trend["total_minutes"] / 60.0
+#             st.plotly_chart(
+#                 hours_line_chart(
+#                     overview_trend["period"],
+#                     overview_trend["hours"],
+#                     granularity.capitalize(),
+#                     "Hours",
+#                 ),
+#                 use_container_width=True,
+#                 key="overview_hours_over_time_chart",
+#             )
+#
+#         top_col1, top_col2 = st.columns(2)
+#
+#         with top_col1:
+#             st.subheader("Top clients")
+#             top_clients = load_top_clients_by_hours(start_date, end_date)
+#             top_clients["hours"] = (top_clients["total_minutes"] / 60.0).round(1)
+#             st.dataframe(
+#                 top_clients[["client_name", "hours"]],
+#                 use_container_width=True,
+#                 hide_index=True,
+#                 column_config={
+#                     "client_name": "Client",
+#                     "hours": "Hours",
+#                 },
+#             )
+#
+#         with top_col2:
+#             st.subheader("Top users")
+#             top_users = load_top_users_by_hours(start_date, end_date)
+#             top_users["hours"] = (top_users["total_minutes"] / 60.0).round(1)
+#             st.dataframe(
+#                 top_users[["user_name", "hours"]],
+#                 use_container_width=True,
+#                 hide_index=True,
+#                 column_config={
+#                     "user_name": "User",
+#                     "hours": "Hours",
+#                 },
+#             )
 
 with tab_clients:
     clients = load_clients()
@@ -288,18 +487,45 @@ with tab_clients:
     if not clients:
         st.info("No clients found.")
     else:
-        st.subheader("Clients")
         client_options = {c["id"]: c["name"] for c in clients}
-        selected_client_ids = multiselect_with_controls(
-            "Client", "clients_tab_selected_client_ids", client_options.keys(), client_options
-        )
+        client_by_id = {c["id"]: c for c in clients}
+        all_projects = load_projects()
+
+        def projects_for_client_ids(client_ids):
+            names = {client_by_id[cid]["name"] for cid in client_ids if cid in client_by_id}
+            return {
+                p["id"] for p in all_projects
+                if p.get("client_id") in client_ids
+                or (p.get("client_id") == INTERNAL_SUPPORT_CLIENT_ID and p.get("name") in names)
+            }
+
+        def on_clients_committed(new_effective, old_effective):
+            added = new_effective - old_effective
+            removed = old_effective - new_effective
+            if not added and not removed:
+                return
+            proj_committed_key = "clients_tab_selected_project_ids_committed"
+            current = st.session_state.get(proj_committed_key)
+            if current is None:
+                return
+            current = set(current)
+            current |= projects_for_client_ids(added)
+            current -= projects_for_client_ids(removed)
+            st.session_state[proj_committed_key] = current
+
+        filter_col1, filter_col2 = st.columns(2)
+
+        with filter_col1:
+            selected_client_ids = multiselect_with_controls(
+                "Client", "clients_tab_selected_client_ids", client_options.keys(), client_options,
+                searchable=True, on_commit=on_clients_committed,
+            )
         selected_clients = [c for c in clients if c["id"] in selected_client_ids]
         selected_client_names = {c["name"] for c in selected_clients}
-        st.caption(f"{len(selected_clients)} of {len(clients)} clients selected")
 
         client_projects = sorted(
             (
-                p for p in load_projects()
+                p for p in all_projects
                 if p.get("client_id") in selected_client_ids
                 or (p.get("client_id") == INTERNAL_SUPPORT_CLIENT_ID and p.get("name") in selected_client_names)
             ),
@@ -307,16 +533,17 @@ with tab_clients:
         )
 
         if not client_projects:
-            st.info("No projects found for the selected clients.")
+            with filter_col2:
+                st.info("No projects found for the selected clients.")
         else:
-            st.subheader("Projects")
             project_options = {p["id"]: p["name"] for p in client_projects}
-            selected_project_ids = multiselect_with_controls(
-                "Project", "clients_tab_selected_project_ids", project_options.keys(), project_options
-            )
-            st.caption(f"{len(selected_project_ids)} of {len(client_projects)} projects selected")
+            with filter_col2:
+                selected_project_ids = multiselect_with_controls(
+                    "Project", "clients_tab_selected_project_ids", project_options.keys(), project_options,
+                    searchable=True,
+                )
 
-            st.subheader("Most hours logged")
+            st.subheader("Most hours logged - by user")
             hours_by_user = load_hours_by_user_for_project(selected_project_ids, start_date, end_date)
 
             if hours_by_user.empty:
@@ -350,6 +577,7 @@ with tab_clients:
                             "Tasks by billable",
                         ),
                         use_container_width=True,
+                        key="clients_tab_billable_pie",
                     )
 
                 with pie_col2:
@@ -364,6 +592,7 @@ with tab_clients:
                             "Tasks by status",
                         ),
                         use_container_width=True,
+                        key="clients_tab_status_pie",
                     )
 
 with tab_users:
@@ -372,14 +601,14 @@ with tab_users:
     if not users:
         st.info("No users found.")
     else:
-        st.subheader("Users")
         user_options = {u["id"]: u["name"] for u in users}
-        selected_user_ids = multiselect_with_controls(
-            "User", "users_tab_selected_user_ids", user_options.keys(), user_options
-        )
-        st.caption(f"{len(selected_user_ids)} of {len(users)} users selected")
+        filter_col, _ = st.columns([1, 3])
+        with filter_col:
+            selected_user_ids = multiselect_with_controls(
+                "User", "users_tab_selected_user_ids", user_options.keys(), user_options, searchable=True
+            )
 
-        st.subheader("Most hours logged")
+        st.subheader("Most hours logged - by project")
         hours_by_project = load_hours_by_project_for_user(selected_user_ids, start_date, end_date)
 
         if hours_by_project.empty:
@@ -412,8 +641,8 @@ with tab_users:
                     "Hours",
                 ),
                 use_container_width=True,
+                key="users_tab_hours_over_time_chart",
             )
-
 
         user_task_ids = load_task_ids_for_user(selected_user_ids, start_date, end_date)
         user_tasks = [t for t in load_tasks() if t.get("id") in user_task_ids]
@@ -433,73 +662,178 @@ with tab_users:
                         "Tasks by billable",
                     ),
                     use_container_width=True,
+                    key="users_tab_billable_pie",
                 )
 
-with tab_support:
-    st.header("Internal Support")
-    st.caption(
-        "Support work is logged under the Internal Support bucket, with one project "
-        "per client. This gives an overview across all clients' support hours."
-    )
+# with tab_support:
+#     st.header("Internal Support")
+#     st.caption(
+#         "Support work is logged under the Internal Support bucket, with one project "
+#         "per client. This gives an overview across all clients' support hours."
+#     )
+#
+#     hours_by_client = load_support_hours_by_client(start_date, end_date)
+#
+#     if hours_by_client.empty:
+#         st.info("No support hours logged in the selected period.")
+#     else:
+#         hours_by_client["hours"] = (hours_by_client["total_minutes"] / 60.0).round(1)
+#
+#         kpi1, kpi2 = st.columns(2)
+#         kpi1.metric("Total support hours", f"{hours_by_client['hours'].sum():,.1f}")
+#         kpi2.metric("Clients with support hours", len(hours_by_client))
+#
+#         st.subheader("Hours by client")
+#         st.dataframe(
+#             hours_by_client[["client_name", "hours"]],
+#             use_container_width=True,
+#             hide_index=True,
+#             column_config={
+#                 "client_name": "Client",
+#                 "hours": "Hours",
+#             },
+#         )
+#
+#         st.subheader("Hours over time")
+#         granularity = hours_granularity(start_date, end_date)
+#         support_hours_over_time = load_support_hours_over_time(start_date, end_date, granularity)
+#
+#         if support_hours_over_time.empty:
+#             st.info("No support hours logged in the selected period.")
+#         else:
+#             support_hours_over_time["hours"] = support_hours_over_time["total_minutes"] / 60.0
+#             st.plotly_chart(
+#                 hours_line_chart(
+#                     support_hours_over_time["period"],
+#                     support_hours_over_time["hours"],
+#                     granularity.capitalize(),
+#                     "Hours",
+#                 ),
+#                 use_container_width=True,
+#             )
+#
+#     support_project_ids = {
+#         p["id"] for p in load_projects()
+#         if p.get("client_id") == INTERNAL_SUPPORT_CLIENT_ID
+#     }
+#     support_tasks = [t for t in load_tasks() if t.get("project_id") in support_project_ids]
+#
+#     if support_tasks:
+#         st.subheader("Support tasks")
+#         pie_col, _ = st.columns(2)
+#
+#         with pie_col:
+#             billable_count = sum(1 for t in support_tasks if is_truthy(t.get("billable")))
+#             non_billable_count = len(support_tasks) - billable_count
+#             st.plotly_chart(
+#                 pie_chart(
+#                     ["Billable", "Non-billable"],
+#                     [billable_count, non_billable_count],
+#                     "Support tasks by billable",
+#                 ),
+#                 use_container_width=True,
+#             )
 
-    hours_by_client = load_support_hours_by_client(start_date, end_date)
+with tab_raw:
+    st.header("Raw data")
+    st.caption("Every logged timetable entry, filterable by client, project and user (on top of the period above).")
 
-    if hours_by_client.empty:
-        st.info("No support hours logged in the selected period.")
+    raw_clients = load_clients()
+    raw_users = load_users()
+
+    if not raw_clients or not raw_users:
+        st.info("No data found.")
     else:
-        hours_by_client["hours"] = (hours_by_client["total_minutes"] / 60.0).round(1)
+        raw_client_options = {c["id"]: c["name"] for c in raw_clients}
+        raw_client_by_id = {c["id"]: c for c in raw_clients}
+        raw_all_projects = load_projects()
 
-        kpi1, kpi2 = st.columns(2)
-        kpi1.metric("Total support hours", f"{hours_by_client['hours'].sum():,.1f}")
-        kpi2.metric("Clients with support hours", len(hours_by_client))
+        def raw_projects_for_client_ids(client_ids):
+            names = {raw_client_by_id[cid]["name"] for cid in client_ids if cid in raw_client_by_id}
+            return {
+                p["id"] for p in raw_all_projects
+                if p.get("client_id") in client_ids
+                or (p.get("client_id") == INTERNAL_SUPPORT_CLIENT_ID and p.get("name") in names)
+            }
 
-        st.subheader("Hours by client")
-        st.dataframe(
-            hours_by_client[["client_name", "hours"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "client_name": "Client",
-                "hours": "Hours",
-            },
+        def on_raw_clients_committed(new_effective, old_effective):
+            added = new_effective - old_effective
+            removed = old_effective - new_effective
+            if not added and not removed:
+                return
+            proj_committed_key = "raw_tab_selected_project_ids_committed"
+            current = st.session_state.get(proj_committed_key)
+            if current is None:
+                return
+            current = set(current)
+            current |= raw_projects_for_client_ids(added)
+            current -= raw_projects_for_client_ids(removed)
+            st.session_state[proj_committed_key] = current
+
+        filter_col1, filter_col2, filter_col3 = st.columns(3)
+
+        with filter_col1:
+            raw_selected_client_ids = multiselect_with_controls(
+                "Client", "raw_tab_selected_client_ids", raw_client_options.keys(), raw_client_options,
+                searchable=True, on_commit=on_raw_clients_committed,
+            )
+        raw_selected_clients = [c for c in raw_clients if c["id"] in raw_selected_client_ids]
+        raw_selected_client_names = {c["name"] for c in raw_selected_clients}
+
+        raw_projects = sorted(
+            (
+                p for p in raw_all_projects
+                if p.get("client_id") in raw_selected_client_ids
+                or (p.get("client_id") == INTERNAL_SUPPORT_CLIENT_ID and p.get("name") in raw_selected_client_names)
+            ),
+            key=lambda p: (p.get("name") or "").lower()
         )
 
-        st.subheader("Hours over time")
-        granularity = hours_granularity(start_date, end_date)
-        support_hours_over_time = load_support_hours_over_time(start_date, end_date, granularity)
-
-        if support_hours_over_time.empty:
-            st.info("No support hours logged in the selected period.")
+        if not raw_projects:
+            with filter_col2:
+                st.info("No projects found for the selected clients.")
         else:
-            support_hours_over_time["hours"] = support_hours_over_time["total_minutes"] / 60.0
-            st.plotly_chart(
-                hours_line_chart(
-                    support_hours_over_time["period"],
-                    support_hours_over_time["hours"],
-                    granularity.capitalize(),
-                    "Hours",
-                ),
-                use_container_width=True,
+            raw_project_options = {p["id"]: p["name"] for p in raw_projects}
+            with filter_col2:
+                raw_selected_project_ids = multiselect_with_controls(
+                    "Project", "raw_tab_selected_project_ids", raw_project_options.keys(), raw_project_options,
+                    searchable=True,
+                )
+
+            raw_user_options = {u["id"]: u["name"] for u in raw_users}
+            with filter_col3:
+                raw_selected_user_ids = multiselect_with_controls(
+                    "User", "raw_tab_selected_user_ids", raw_user_options.keys(), raw_user_options,
+                    searchable=True,
+                )
+
+            raw_entries = load_raw_entries(
+                raw_selected_project_ids, raw_selected_user_ids, start_date, end_date
             )
 
-    support_project_ids = {
-        p["id"] for p in load_projects()
-        if p.get("client_id") == INTERNAL_SUPPORT_CLIENT_ID
-    }
-    support_tasks = [t for t in load_tasks() if t.get("project_id") in support_project_ids]
+            if raw_entries.empty:
+                st.info("No entries match the selected filters.")
+            else:
+                raw_entries["hours"] = (raw_entries["duration"] / 60.0).round(2)
+                raw_entries["approved"] = raw_entries["approved"].apply(is_truthy)
 
-    if support_tasks:
-        st.subheader("Support tasks")
-        pie_col, _ = st.columns(2)
-
-        with pie_col:
-            billable_count = sum(1 for t in support_tasks if is_truthy(t.get("billable")))
-            non_billable_count = len(support_tasks) - billable_count
-            st.plotly_chart(
-                pie_chart(
-                    ["Billable", "Non-billable"],
-                    [billable_count, non_billable_count],
-                    "Support tasks by billable",
-                ),
-                use_container_width=True,
-            )
+                st.caption(f"{len(raw_entries)} entries")
+                st.dataframe(
+                    raw_entries[[
+                        "date", "client_name", "project_name", "task_name", "user_name",
+                        "hours", "approved", "internal_description", "external_description",
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "date": "Date",
+                        "client_name": "Client",
+                        "project_name": "Project",
+                        "task_name": "Task",
+                        "user_name": "User",
+                        "hours": "Hours",
+                        "approved": "Approved",
+                        "internal_description": "Internal description",
+                        "external_description": "External description",
+                    },
+                )
